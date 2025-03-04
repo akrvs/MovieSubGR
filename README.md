@@ -1,4 +1,4 @@
-# SubtitlesProject
+# MovieSubGR
 
 A Python application that automatically transcribes videos, translates the transcriptions to Greek, and embeds the subtitles back into the video.
 
@@ -72,10 +72,6 @@ A Python application that automatically transcribes videos, translates the trans
 - To use a different Whisper model size, modify the `model_size` parameter in the `transcribe_audio` function call in `main.py`.
 - To translate to a language other than Greek, modify the target language in `translator.py`.
 - To customize subtitle appearance, adjust the `force_style` parameter in `subtitles_emb.py`.
-
-## License
-
-[Add your chosen license here]
 
 ## Acknowledgements
 
