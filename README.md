@@ -1,80 +1,110 @@
-# MovieSubGR
+# Subsmith
 
-A Python application that automatically transcribes videos, translates the transcriptions to Greek, and embeds the subtitles back into the video.
+Subsmith turns any video into a subtitled video in one command. It extracts and loudness-normalizes the audio, transcribes speech with Whisper, translates each line into the target language, and burns clean subtitles back into the video.
 
-## Features
+[![CI](https://github.com/akrvs/Subsmith/actions/workflows/ci.yml/badge.svg)](https://github.com/akrvs/Subsmith/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-- Extract audio from video files using FFmpeg
-- Apply noise reduction to improve audio quality
-- Transcribe audio to text using OpenAI's Whisper model
-- Translate transcriptions from English to Greek using Google Translate
-- Generate SRT subtitle files
-- Embed subtitles into the original video
+## Problem
 
-## Prerequisites
+Generating translated subtitles is a multi-stage media problem: demux audio, run speech-to-text with accurate timestamps, translate hundreds of short lines, serialize valid SRT timing, and re-encode the video with a burned-in track. Doing this naively breaks in predictable ways. Translating one segment per blocking network call makes a feature-length film take many minutes and fall over on the first transient error. A single hard-coded path and a flat script make the tool impossible to reuse or test. Subsmith treats the workflow as a real pipeline with isolated, swappable stages.
 
-- Python 3.9
-- FFmpeg installed on your system
+## Approach
 
-## Installation
+```
+ video ──> [ffmpeg extract + loudnorm] ──> audio
+                                             │
+                                             v
+                                     [Whisper STT] ──> timed segments
+                                             │
+                                             v
+                            [concurrent translator] ──> translated segments
+                                             │
+                                             v
+                                      [SRT writer] ──> .srt
+                                             │
+                                             v
+                            [ffmpeg burn-in] ──> subtitled video
+```
 
-1. Clone this repository:
-   ```
-   git clone https://github.com/yourusername/SubtitlesProject.git
-   cd SubtitlesProject
-   ```
+Each stage sits behind a small interface (`Transcriber`, `Translator`, `Media`), and `SubtitlePipeline` wires them together. Because the stages are decoupled, every backend can be swapped and the orchestration can be tested without ffmpeg, model weights, or a network.
 
-2. Create a virtual environment and activate it:
-   ```
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows, use: .venv\Scripts\activate
-   ```
+## Design decisions
 
-3. Install the required packages:
-   ```
-   pip install openai-whisper pydub deep_translator srt
-   ```
+- **Concurrent, resilient translation.** The original approach issued one blocking call per subtitle line. Subsmith deduplicates repeated lines, fans the unique set out across a thread pool, and wraps each call in exponential-backoff retries, then reassembles results in the original order. Fewer calls, faster runs, and tolerance for transient API failures.
+- **faster-whisper over openai-whisper.** The CTranslate2 backend is several times faster on CPU at equal model size and exposes word-accurate segment timestamps that map directly onto SRT cues.
+- **Honest audio handling.** The legacy "noise reduction" step only normalized levels with pydub (a dependency that no longer builds on modern Python). Subsmith performs EBU R128 loudness normalization with ffmpeg's `loudnorm` filter during extraction, removing the extra dependency and naming the step for what it does.
+- **Pluggable translation backend.** Google Translate (no API key) is the default so the tool runs out of the box, but `Translator` is an interface; a DeepL or LLM backend drops in without touching the pipeline.
+- **Typed configuration.** Pydantic settings (`SUBSMITH_*`) control model size, languages, concurrency, and styling with no code edits.
 
-## Usage
+## Quick start
 
-1. Update the `video_file` path in `main.py` to point to your video file:
-   ```python
-   video_file = "/path/to/your/video.mp4"
-   ```
+```bash
+pip install -e ".[transcription]"
 
-2. Run the application:
-   ```
-   python main.py
-   ```
+subsmith run movie.mkv
+subsmith run movie.mkv --target fr --model medium
+subsmith transcribe movie.mkv --subtitles movie.srt
+```
 
-3. The script will:
-   - Extract audio from the video file
-   - Reduce noise in the audio
-   - Transcribe the audio to text
-   - Translate the text to Greek
-   - Generate an SRT subtitle file
-   - Embed the subtitles into the original video
+ffmpeg must be installed and on `PATH`. The first run downloads the selected Whisper model once.
 
-4. The final video with embedded subtitles will be saved as `final_video.mp4`
+### Docker
 
-## Module Overview
+```bash
+docker build -t subsmith .
+docker run --rm -v "$PWD:/work" -w /work subsmith run movie.mkv
+```
 
-- `audio_extraction.py`: Extracts audio from video files using FFmpeg
-- `noise_reduction.py`: Applies noise normalization to improve audio quality
-- `STT.py`: Transcribes audio using OpenAI's Whisper model
-- `translator.py`: Translates text from English to Greek using Google Translate
-- `subtitles_generation.py`: Generates SRT subtitle files
-- `subtitles_emb.py`: Embeds subtitles into videos
-- `main.py`: Orchestrates the entire process
+The image ships with ffmpeg preinstalled.
 
-## Customization
+## Configuration
 
-- To use a different Whisper model size, modify the `model_size` parameter in the `transcribe_audio` function call in `main.py`.
-- To translate to a language other than Greek, modify the target language in `translator.py`.
-- To customize subtitle appearance, adjust the `force_style` parameter in `subtitles_emb.py`.
+| Variable                          | Default | Description                              |
+| --------------------------------- | ------- | ---------------------------------------- |
+| `SUBSMITH_WHISPER_MODEL`          | `small` | Whisper model size                       |
+| `SUBSMITH_SOURCE_LANGUAGE`        | auto    | Force a source language, or autodetect   |
+| `SUBSMITH_TARGET_LANGUAGE`        | `el`    | Translation target language code         |
+| `SUBSMITH_TRANSLATION_WORKERS`    | `8`     | Concurrent translation workers           |
+| `SUBSMITH_TRANSLATION_MAX_RETRIES`| `3`     | Retries per line on transient failure    |
+| `SUBSMITH_SUBTITLE_FONT_SIZE`     | `24`    | Burned-in subtitle font size             |
 
-## Acknowledgements
+## Project layout
 
-- [OpenAI Whisper](https://github.com/openai/whisper) for speech-to-text transcription
-- [Deep Translator](https://github.com/nidhaloff/deep-translator) for translation capabilities
-- [FFmpeg](https://ffmpeg.org/) for audio extraction and subtitle embedding
+```
+src/subsmith/
+  config.py              Pydantic settings
+  models.py              Segment model with timing validation
+  media/                 Media protocol + ffmpeg extraction and burn-in
+  transcription/         Transcriber protocol + faster-whisper backend
+  translation/           Translator protocol + concurrent, retrying backend
+  subtitles/             SRT serialization
+  pipeline.py            Stage orchestration
+  factory.py             Default pipeline assembly from settings
+  cli.py                 Typer command line
+tests/                   Unit tests with fakes (no ffmpeg or models required)
+```
+
+## Testing
+
+```bash
+pip install -e ".[dev]"
+make test
+make lint
+```
+
+The pipeline, translation concurrency and retry logic, SRT serialization, ffmpeg command construction, and configuration are tested with injected fakes, so the suite runs fast and offline. CI runs lint, type checking, and tests on Python 3.10 through 3.12.
+
+## Roadmap
+
+- Word-level karaoke-style subtitle timing
+- Optional soft-subtitle muxing (mov_text) alongside burn-in
+- Batch mode for directories and glob patterns
+- Speaker diarization for multi-speaker labeling
+- DeepL and LLM translation backends with glossary support
+- Progress reporting and resumable runs for long videos
+
+## License
+
+MIT
